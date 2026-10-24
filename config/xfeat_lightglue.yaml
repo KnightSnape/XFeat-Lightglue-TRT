@@ -1,7 +1,7 @@
 # Main params for XFeat
 max_keypoints: 512
-image_width: 800
-image_height: 800
+image_width: 1241
+image_height: 376
 
 #Non-Max Suppression params
 feat_threshold: 0.05

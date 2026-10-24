@@ -3,9 +3,12 @@
 
 #include <NvInfer.h>
 #include <NvInferRuntime.h>
+#include <NvInferVersion.h>
 #include "NvInferPlugin.h"
 #include <cuda_runtime.h>
 #include <torch/torch.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <opencv2/opencv.hpp>
 #include <vector>
 #include <memory>
@@ -34,20 +37,12 @@ struct DestroyObjects {
     template <typename T>
     void operator()(T* ptr) const {
         if (ptr) {
-            destroy(ptr);
+#if NV_TENSORRT_MAJOR >= 10
+            delete ptr;
+#else
+            ptr->destroy();
+#endif
         }
-    }
-private:
-    // Enable if T has a destroy() member function (TensorRT objects). SFINAE (Substitution Failure Is Not An Error) 
-    template <typename T>
-    typename std::enable_if<std::is_member_function_pointer<decltype(&T::destroy)>::value>::type
-    destroy(T* ptr) const {
-        ptr->destroy();
-    }
-
-    // Fallback for CUDA memory (void*)
-    void destroy(void* ptr) const {
-        cudaFree(ptr);
     }
 };
 
@@ -64,6 +59,7 @@ class XFeat
     * @param engine_path Path to the weights folder containing the .engine file.
    */
     XFeat(const std::string config_path, const std::string engine_path);
+    ~XFeat() = default;
 
     /**
     * @brief Function to perform sparse keypoint detection by inferencing on the TensorRT engine. It preprocesses the data, performs inference, postprocesses the outputs and returns them.
@@ -146,6 +142,7 @@ class XFeat
     std::unique_ptr<IRuntime, DestroyObjects> runtime;
     std::unique_ptr<ICudaEngine, DestroyObjects> engine;
     std::unique_ptr<IExecutionContext, DestroyObjects> context;
+    c10::cuda::CUDAStream stream_;
 
     //TensorRT Logger
     Logger gLogger;
@@ -167,7 +164,7 @@ class XFeat
     cv::Mat preprocessedImage;
 
     //Tensor to store output data
-    torch::Tensor featsData, keypointsData, heatmapData;
+    torch::Tensor featsData, keypointsData, heatmapData, scaleData;
 
     //Torch device (Must be CUDA)
     torch::Device dev;

@@ -30,8 +30,9 @@ static void TensorToVectorKeypoints(const torch::Tensor& keypoints_tensor, std::
     const float* data = cont_tensor.data_ptr<float>();
     // 计算元素总数
     size_t num_elements = cont_tensor.numel();
-    // 复制数据到 vector
-    keypoints_vector = std::vector<float>(data, data + num_elements);
+    // Reuse vector capacity across frames.
+    keypoints_vector.resize(num_elements);
+    std::copy(data, data + num_elements, keypoints_vector.begin());
 
 }
 

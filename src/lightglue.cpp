@@ -9,7 +9,31 @@
 
 using namespace nvinfer1;
 
-#define CHECK(status) \
+#if NV_TENSORRT_MAJOR >= 10
+class PreallocatedOutputAllocator final : public nvinfer1::IOutputAllocator {
+public:
+    PreallocatedOutputAllocator(void* memory, uint64_t capacity)
+        : memory_(memory), capacity_(capacity) {}
+
+    void* reallocateOutputAsync(const char*, void*, uint64_t size,
+                                uint64_t, cudaStream_t) noexcept override {
+        return size <= capacity_ ? memory_ : nullptr;
+    }
+
+    void notifyShape(const char*, const nvinfer1::Dims& dims) noexcept override {
+        dims_ = dims;
+    }
+
+    const nvinfer1::Dims& dims() const noexcept { return dims_; }
+
+private:
+    void* memory_;
+    uint64_t capacity_;
+    nvinfer1::Dims dims_{};
+};
+#endif
+
+#define CUDA_CHECK(status) \
     do { \
         auto ret = (status); \
         if (ret != 0) { \
@@ -22,11 +46,19 @@ using namespace nvinfer1;
 using namespace nvinfer1;
 
 void printBindingsInfo(nvinfer1::ICudaEngine* engine) {
+#if NV_TENSORRT_MAJOR >= 10
+    int nbBindings = engine->getNbIOTensors();
+    for (int i = 0; i < nbBindings; ++i) {
+        const char* name = engine->getIOTensorName(i);
+        nvinfer1::Dims dims = engine->getTensorShape(name);
+        bool isInput = engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
+#else
     int nbBindings = engine->getNbBindings();
     for (int i = 0; i < nbBindings; ++i) {
         const char* name = engine->getBindingName(i);
         nvinfer1::Dims dims = engine->getBindingDimensions(i);
         bool isInput = engine->bindingIsInput(i);
+#endif
 
         std::cout << (isInput ? "[Input] " : "[Output] ") << name << ": (";
         for (int j = 0; j < dims.nbDims; ++j) {
@@ -45,6 +77,9 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
     std::string engineFilePath = engine_path;
     maxMatches = config["max_matches"].as<int>();
     threShold = config["match_threshold"].as<double>();
+    inputW = config["image_width"].as<int>();
+    inputH = config["image_height"].as<int>();
+    top_k = config["max_keypoints"].as<int>();
 
     // Load and initialize the engine
     loadEngine(engineFilePath);
@@ -53,7 +88,8 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
         throw std::runtime_error("Failed to create execution context");
     }
 
-    //Get engine bindings
+    // TensorRT 8 uses binding indices; TensorRT 10 uses tensor names.
+#if NV_TENSORRT_MAJOR < 10
     image0_size_Index = engine->getBindingIndex("image0_size");
     image1_size_Index = engine->getBindingIndex("image1_size");
     keypoints_0_Index = engine->getBindingIndex("mkpts0");
@@ -62,9 +98,10 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
     descriptors_1_Index = engine->getBindingIndex("feats1");
     matches_Index = engine->getBindingIndex("matches");
     scores_Index = engine->getBindingIndex("scores");
+#endif
 
 
-    int kpt_num = 512;
+    int kpt_num = top_k;
 
     // 输入维度在这里设置
     nvinfer1::Dims dim1;
@@ -75,6 +112,16 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
     dim2.nbDims = 1;      // 1个维度
     dim2.d[0] = 2;        // 值为2
 
+#if NV_TENSORRT_MAJOR >= 10
+    if (!context->setInputShape("image0_size", dim1) ||
+        !context->setInputShape("image1_size", dim2) ||
+        !context->setInputShape("mkpts0", nvinfer1::Dims3{1, kpt_num, 2}) ||
+        !context->setInputShape("mkpts1", nvinfer1::Dims3{1, kpt_num, 2}) ||
+        !context->setInputShape("feats0", nvinfer1::Dims3{1, kpt_num, 64}) ||
+        !context->setInputShape("feats1", nvinfer1::Dims3{1, kpt_num, 64})) {
+        throw std::runtime_error("Failed to set LightGlue input shapes");
+    }
+#else
     context->setBindingDimensions(image0_size_Index, dim1);
     context->setBindingDimensions(image1_size_Index, dim2);
     context->setBindingDimensions(keypoints_0_Index, nvinfer1::Dims3{1, kpt_num, 2});
@@ -82,85 +129,143 @@ Lightglue::Lightglue(const std::string config_path, const std::string engine_pat
     context->setBindingDimensions(descriptors_0_Index, nvinfer1::Dims3{1, kpt_num, 64});
     context->setBindingDimensions(descriptors_1_Index, nvinfer1::Dims3{1, kpt_num, 64});
     assert(context->allInputDimensionsSpecified());
+#endif
 
+    kpts_bytes_ = static_cast<size_t>(top_k) * 2 * sizeof(float);
+    desc_bytes_ = static_cast<size_t>(top_k) * 64 * sizeof(float);
+    matches_bytes_ = static_cast<size_t>(maxMatches) * 2 * sizeof(int64_t);
+    scores_bytes_ = static_cast<size_t>(maxMatches) * sizeof(float);
+    host_matches_.resize(static_cast<size_t>(maxMatches) * 2);
+    host_scores_.resize(static_cast<size_t>(maxMatches));
+
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_imgsize0_), 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_imgsize1_), 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_kpts0_), kpts_bytes_));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_kpts1_), kpts_bytes_));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_desc0_), desc_bytes_));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_desc1_), desc_bytes_));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_matches_), matches_bytes_));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scores_), scores_bytes_));
+
+    const std::vector<float> image_size{
+        static_cast<float>(inputW), static_cast<float>(inputH)};
+    CUDA_CHECK(cudaMemcpyAsync(d_imgsize0_, image_size.data(), 2 * sizeof(float),
+                               cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_imgsize1_, image_size.data(), 2 * sizeof(float),
+                               cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
-void Lightglue::matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches)
+Lightglue::~Lightglue()
 {
-    size_t img0_size = 2 * sizeof(float);
-    size_t img1_size = 2 * sizeof(float);
-    size_t kpt_num = 512;
-    size_t kpts_size = 1 * kpt_num * 2 * sizeof(int);
-    size_t desc_size = 1 * kpt_num * 64 * sizeof(float);
-    size_t max_matches = maxMatches;
-    size_t match_output_size = max_matches * 2 * sizeof(int);
-    size_t score_output_size = max_matches * sizeof(float);
+    if (stream_) cudaStreamSynchronize(stream_);
+    if (d_imgsize0_) cudaFree(d_imgsize0_);
+    if (d_imgsize1_) cudaFree(d_imgsize1_);
+    if (d_kpts0_) cudaFree(d_kpts0_);
+    if (d_kpts1_) cudaFree(d_kpts1_);
+    if (d_desc0_) cudaFree(d_desc0_);
+    if (d_desc1_) cudaFree(d_desc1_);
+    if (d_matches_) cudaFree(d_matches_);
+    if (d_scores_) cudaFree(d_scores_);
+    if (stream_) cudaStreamDestroy(stream_);
+}
 
-    float *d_imgsize0, *d_imgsize1, *d_kpts0, *d_kpts1, *d_desc0, *d_desc1, *d_scores;
-    int *d_matches;
-    CHECK(cudaMalloc((void**)&d_imgsize0, img0_size));
-    CHECK(cudaMalloc((void**)&d_imgsize1, img1_size));
-    CHECK(cudaMalloc((void**)&d_kpts0, kpts_size));
-    CHECK(cudaMalloc((void**)&d_kpts1, kpts_size));
-    CHECK(cudaMalloc((void**)&d_desc0, desc_size));
-    CHECK(cudaMalloc((void**)&d_desc1, desc_size));
-    CHECK(cudaMalloc((void**)&d_matches, match_output_size));
-    CHECK(cudaMalloc((void**)&d_scores, score_output_size));
+void Lightglue::matching(const std::vector<float>& keypoints1,
+                         const std::vector<float>& keypoints2,
+                         const std::vector<float>& feats1,
+                         const std::vector<float>& feats2,
+                         std::vector<MatchPoint>& matches)
+{
+    const size_t expected_kpts = static_cast<size_t>(top_k) * 2;
+    const size_t expected_desc = static_cast<size_t>(top_k) * 64;
+    if (keypoints1.size() < expected_kpts || keypoints2.size() < expected_kpts ||
+        feats1.size() < expected_desc || feats2.size() < expected_desc) {
+        throw std::runtime_error("LightGlue received fewer features than its fixed engine shape");
+    }
+    matches.clear();
 
-    CHECK(cudaMemcpy(d_imgsize0, std::vector<float>{800.0f, 800.0f}.data(), img0_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_imgsize1, std::vector<float>{800.0f, 800.0f}.data(), img1_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_kpts0, keypoints1.data(), kpts_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_kpts1, keypoints2.data(), kpts_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_desc0, feats1.data(), desc_size, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_desc1, feats2.data(), desc_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_kpts0_, keypoints1.data(), kpts_bytes_,
+                               cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_kpts1_, keypoints2.data(), kpts_bytes_,
+                               cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_desc0_, feats1.data(), desc_bytes_,
+                               cudaMemcpyHostToDevice, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(d_desc1_, feats2.data(), desc_bytes_,
+                               cudaMemcpyHostToDevice, stream_));
     
+#if NV_TENSORRT_MAJOR >= 10
+    PreallocatedOutputAllocator matches_allocator(d_matches_, matches_bytes_);
+    PreallocatedOutputAllocator scores_allocator(d_scores_, scores_bytes_);
+    if (!context->setTensorAddress("image0_size", d_imgsize0_) ||
+        !context->setTensorAddress("image1_size", d_imgsize1_) ||
+        !context->setTensorAddress("mkpts0", d_kpts0_) ||
+        !context->setTensorAddress("mkpts1", d_kpts1_) ||
+        !context->setTensorAddress("feats0", d_desc0_) ||
+        !context->setTensorAddress("feats1", d_desc1_) ||
+        !context->setTensorAddress("matches", d_matches_) ||
+        !context->setTensorAddress("scores", d_scores_) ||
+        !context->setOutputAllocator("matches", &matches_allocator) ||
+        !context->setOutputAllocator("scores", &scores_allocator) ||
+        !context->enqueueV3(stream_)) {
+        throw std::runtime_error("TensorRT LightGlue inference failed");
+    }
+    CUDA_CHECK(cudaMemcpyAsync(host_matches_.data(), d_matches_, matches_bytes_,
+                               cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaMemcpyAsync(host_scores_.data(), d_scores_, scores_bytes_,
+                               cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+#else
     void* bindings[8];
-    bindings[image0_size_Index] = d_imgsize0;
-    bindings[image1_size_Index] = d_imgsize1;
-    bindings[keypoints_0_Index] = d_kpts0;
-    bindings[keypoints_1_Index] = d_kpts1;
-    bindings[descriptors_0_Index] = d_desc0;
-    bindings[descriptors_1_Index] = d_desc1;
-    bindings[matches_Index] = d_matches;
-    bindings[scores_Index] = d_scores;
+    bindings[image0_size_Index] = d_imgsize0_;
+    bindings[image1_size_Index] = d_imgsize1_;
+    bindings[keypoints_0_Index] = d_kpts0_;
+    bindings[keypoints_1_Index] = d_kpts1_;
+    bindings[descriptors_0_Index] = d_desc0_;
+    bindings[descriptors_1_Index] = d_desc1_;
+    bindings[matches_Index] = d_matches_;
+    bindings[scores_Index] = d_scores_;
 
     // auto start = std::chrono::high_resolution_clock::now();
 
     // Run inference on TensorRT engine
-    context->enqueueV2(bindings, 0, nullptr);
+    context->enqueueV2(bindings, stream_, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+#endif
 
     // auto end = std::chrono::high_resolution_clock::now();
     // std::chrono::duration<double, std::milli> duration = end - start;
     // std::cout<<"LightGlue Inference benchmark done "<< duration.count() << " ms"<< std::endl;
 
     // Dims match_dims = context->getBindingDimensions(matches_Index);
+#if NV_TENSORRT_MAJOR >= 10
+    nvinfer1::Dims match_dims = matches_allocator.dims();
+#else
     nvinfer1::Dims match_dims = context->getTensorShape("matches");
-    Dims score_dims = context->getBindingDimensions(scores_Index);
+#endif
     int num_matches = match_dims.d[0];
+    if (match_dims.nbDims != 2 || num_matches < 0 ||
+        num_matches > maxMatches) {
+        throw std::runtime_error(
+            "Invalid LightGlue output shape: matches=" +
+            std::to_string(num_matches));
+    }
 
-    std::vector<int> h_matches(num_matches * 2);
-    std::vector<float> h_scores(num_matches);
-
-    CHECK(cudaMemcpy(h_matches.data(), d_matches, num_matches * 2 * sizeof(int), cudaMemcpyDeviceToHost));
-    CHECK(cudaMemcpy(h_scores.data(), d_scores, num_matches * sizeof(float), cudaMemcpyDeviceToHost));
+#if NV_TENSORRT_MAJOR < 10
+    CUDA_CHECK(cudaMemcpy(host_matches_.data(), d_matches_,
+                          num_matches * 2 * sizeof(int64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(host_scores_.data(), d_scores_,
+                          num_matches * sizeof(float), cudaMemcpyDeviceToHost));
+#endif
 
     // 过滤低分匹配对，并保存
     for (int i = 0; i < num_matches; ++i) {
-        // std::cout << "Match[" << i << "] = (" << h_matches[i * 2]
-        //         << ", " << h_matches[i * 2 + 1] << "), Score = " << h_scores[i] << std::endl;
-        if (h_scores[i] >= threShold){
-            matches.push_back({h_matches[i * 2], h_matches[i * 2 + 1], h_scores[i]});
+        if (host_scores_[i] >= threShold){
+            matches.push_back({static_cast<int>(host_matches_[i * 2]),
+                               static_cast<int>(host_matches_[i * 2 + 1]),
+                               host_scores_[i]});
         }
     }
-
-    cudaFree(d_imgsize0);
-    cudaFree(d_imgsize1);
-    cudaFree(d_kpts0);
-    cudaFree(d_kpts1);
-    cudaFree(d_desc0);
-    cudaFree(d_desc1);
-    cudaFree(d_matches);
-    cudaFree(d_scores);
 }
 
 

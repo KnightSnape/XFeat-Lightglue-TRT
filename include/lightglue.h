@@ -3,6 +3,7 @@
 
 #include <NvInfer.h>
 #include <NvInferRuntime.h>
+#include <NvInferVersion.h>
 #include "NvInferPlugin.h"
 #include <cuda_runtime.h>
 #include <torch/torch.h>
@@ -39,20 +40,12 @@ struct GlueDestroyObjects {
     template <typename T>
     void operator()(T* ptr) const {
         if (ptr) {
-            destroy(ptr);
+#if NV_TENSORRT_MAJOR >= 10
+            delete ptr;
+#else
+            ptr->destroy();
+#endif
         }
-    }
-private:
-    // Enable if T has a destroy() member function (TensorRT objects). SFINAE (Substitution Failure Is Not An Error) 
-    template <typename T>
-    typename std::enable_if<std::is_member_function_pointer<decltype(&T::destroy)>::value>::type
-    destroy(T* ptr) const {
-        ptr->destroy();
-    }
-
-    // Fallback for CUDA memory (void*)
-    void destroy(void* ptr) const {
-        cudaFree(ptr);
     }
 };
 
@@ -69,6 +62,7 @@ class Lightglue
     * @param engine_path Path to the weights folder containing the .engine file.
    */
     Lightglue(const std::string config_path, const std::string engine_path);
+    ~Lightglue();
 
     /**
     * @brief Function to perform sparse keypoint detection by inferencing on the TensorRT engine. It preprocesses the data, performs inference, postprocesses the outputs and returns them.
@@ -77,7 +71,11 @@ class Lightglue
     * @param descriptors Descriptors of the keypoints.
     * @param scores Confidence scores of the keypoints.
    */
-    void matching(std::vector<float> keypoints1, std::vector<float> keypoints2, std::vector<float> feats1, std::vector<float> feats2, std::vector<MatchPoint>& matches);
+    void matching(const std::vector<float>& keypoints1,
+                  const std::vector<float>& keypoints2,
+                  const std::vector<float>& feats1,
+                  const std::vector<float>& feats2,
+                  std::vector<MatchPoint>& matches);
 
     /**
     * @brief Function to perform dense keypoint detection by inferencing on the TensorRT engine. It preprocesses the data, performs inference, postprocesses the outputs and returns them.
@@ -139,6 +137,22 @@ class Lightglue
     std::unique_ptr<IRuntime, GlueDestroyObjects> runtime;
     std::unique_ptr<ICudaEngine, GlueDestroyObjects> engine;
     std::unique_ptr<IExecutionContext, GlueDestroyObjects> context;
+    cudaStream_t stream_{nullptr};
+
+    float* d_imgsize0_{nullptr};
+    float* d_imgsize1_{nullptr};
+    float* d_kpts0_{nullptr};
+    float* d_kpts1_{nullptr};
+    float* d_desc0_{nullptr};
+    float* d_desc1_{nullptr};
+    int64_t* d_matches_{nullptr};
+    float* d_scores_{nullptr};
+    size_t kpts_bytes_{0};
+    size_t desc_bytes_{0};
+    size_t matches_bytes_{0};
+    size_t scores_bytes_{0};
+    std::vector<int64_t> host_matches_;
+    std::vector<float> host_scores_;
 
     //TensorRT 
     GlueLogger gLogger;

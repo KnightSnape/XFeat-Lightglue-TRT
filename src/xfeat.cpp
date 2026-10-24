@@ -9,7 +9,8 @@
 
 using namespace nvinfer1;
 
-XFeat::XFeat(const std::string config_path, const std::string engine_path):dev(torch::kCUDA)
+XFeat::XFeat(const std::string config_path, const std::string engine_path)
+    : stream_(c10::cuda::getStreamFromPool()), dev(torch::kCUDA)
 {
     YAML::Node config = YAML::LoadFile(config_path);
 
@@ -45,11 +46,22 @@ XFeat::XFeat(const std::string config_path, const std::string engine_path):dev(t
     rh = static_cast<float>(inputH) / static_cast<float>(_H);
     rw = static_cast<float>(inputW) / static_cast<float>(_W);
 
-    //Get engine bindings
+    // These TensorRT output buffers have fixed shapes and are reused for every
+    // frame. Torch operations below run on the same non-default CUDA stream.
+    c10::cuda::CUDAStreamGuard stream_guard(stream_);
+    const auto options = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+    featsData = torch::empty({1, 64, outputH, outputW}, options);
+    keypointsData = torch::empty({1, 65, outputH, outputW}, options);
+    heatmapData = torch::empty({1, 1, outputH, outputW}, options);
+    scaleData = torch::tensor({rw, rh}, torch::kFloat32).to(dev).view({1, 1, -1});
+
+    // TensorRT 8 uses binding indices; TensorRT 10 uses tensor names.
+#if NV_TENSORRT_MAJOR < 10
     inputIndex = engine->getBindingIndex("images");
     featsIndex = engine->getBindingIndex("feats");
     keypointsIndex = engine->getBindingIndex("keypoints");
     heatmapIndex = engine->getBindingIndex("heatmaps");
+#endif
 
     //Sparse interpolator for post-processing outputs
     _nearest = InterpolateSparse2D("nearest");
@@ -59,18 +71,23 @@ XFeat::XFeat(const std::string config_path, const std::string engine_path):dev(t
 
 void XFeat::detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch::Tensor& descriptors, torch::Tensor& scores)
 {
+    c10::cuda::CUDAStreamGuard stream_guard(stream_);
 
     // Preprocess input image and convert to Tensor on GPU
     torch::Tensor input_Data = preprocessImages(img);
 
     batchSize = input_Data.size(0);
 
-    // Variables to store output from TensorRT engine
-    featsData = torch::empty({batchSize,64,outputH,outputW}, torch::device(dev).dtype(torch::kFloat32));
-    keypointsData = torch::empty({batchSize, 65, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
-    heatmapData = torch::empty({batchSize, 1, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
-
-    // Create buffer to store input and outputs of TensorRT engine
+    // Create buffer to store input and outputs of TensorRT engine.
+#if NV_TENSORRT_MAJOR >= 10
+    if (!context->setTensorAddress("images", input_Data.data_ptr()) ||
+        !context->setTensorAddress("feats", featsData.data_ptr()) ||
+        !context->setTensorAddress("keypoints", keypointsData.data_ptr()) ||
+        !context->setTensorAddress("heatmaps", heatmapData.data_ptr()) ||
+        !context->enqueueV3(stream_.stream())) {
+        throw std::runtime_error("TensorRT XFeat inference failed");
+    }
+#else
     void* buffers[4]; 
     buffers[inputIndex] = input_Data.data_ptr();
     buffers[featsIndex] = featsData.data_ptr();
@@ -82,17 +99,20 @@ void XFeat::detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch
     
     // Run inference on TensorRT engine
     context->executeV2(buffers);
+#endif
     
     // auto end = std::chrono::high_resolution_clock::now();
     // std::chrono::duration<double, std::milli> duration = end - start;
     // std::cout<<"Xfeat Inference benchmark done "<< duration.count() << " ms"<< std::endl;
 
 
-    featsData = torch::nn::functional::normalize(featsData, torch::nn::functional::NormalizeFuncOptions().dim(1));
-    keypointsData = get_kpts_heatmap(keypointsData,softmaxTemp);
-    auto mkpts = NMS(keypointsData,threshold, kernel_size);
+    auto normalized_feats = torch::nn::functional::normalize(
+        featsData, torch::nn::functional::NormalizeFuncOptions().dim(1));
+    auto keypoint_heatmap = get_kpts_heatmap(keypointsData,softmaxTemp);
+    auto mkpts = NMS(keypoint_heatmap,threshold, kernel_size);
 
-    auto scores_ = (_nearest.forward(keypointsData, mkpts, _H, _W) * bilinear.forward(heatmapData, mkpts, _H, _W)).squeeze(-1);
+    auto scores_ = (_nearest.forward(keypoint_heatmap, mkpts, _H, _W) *
+                    bilinear.forward(heatmapData, mkpts, _H, _W)).squeeze(-1);
 
     // Masking
     auto mask_ = torch::all(mkpts == 0, -1);
@@ -107,14 +127,13 @@ void XFeat::detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch
     scores_ = torch::gather(scores_, -1, idxs);
 
     // Interpolate descriptors
-    auto feats = bilinear.forward(featsData, mkpts, _H, _W);
+    auto feats = bilinear.forward(normalized_feats, mkpts, _H, _W);
 
     // L2-Normalize
     feats = torch::nn::functional::normalize(feats, torch::nn::functional::NormalizeFuncOptions().dim(-1));
 
     // Correct keypoint scale
-    auto scale = torch::tensor({rw, rh}, torch::kFloat32).to(dev).view({1, 1, -1});
-    mkpts = mkpts * scale;
+    mkpts = mkpts * scaleData;
 
     // Validity mask
     auto valid = (scores_ > 0);
@@ -124,9 +143,6 @@ void XFeat::detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch
     auto scores_valid = scores_.index({valid});
     auto descriptors_valid = feats.index({valid});
 
-    // Synchronize all operations before moving the results back to the CPU
-    torch::cuda::synchronize();
-
     // Transfer the valid points to the CPU
     keypoints = keypoints_valid.cpu();
     scores = scores_valid.cpu();
@@ -135,17 +151,22 @@ void XFeat::detectAndCompute(const cv::Mat& img, torch::Tensor& keypoints, torch
 
 void XFeat::detectDense(const cv::Mat& img, torch::Tensor& keypoints, torch::Tensor& descriptors)
 {
+    c10::cuda::CUDAStreamGuard stream_guard(stream_);
     // Preprocess input image and convert to Tensor on GPU
     torch::Tensor input_Data = preprocessImages(img);
 
     batchSize = input_Data.size(0);
 
-    // Variables to store output from TensorRT engine
-    featsData = torch::empty({batchSize,64,outputH,outputW}, torch::device(dev).dtype(torch::kFloat32));
-    keypointsData = torch::empty({batchSize, 65, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
-    heatmapData = torch::empty({batchSize, 1, outputH, outputW}, torch::device(dev).dtype(torch::kFloat32));
-
-    // Create buffer to store input and outputs of TensorRT engine
+    // Create buffer to store input and outputs of TensorRT engine.
+#if NV_TENSORRT_MAJOR >= 10
+    if (!context->setTensorAddress("images", input_Data.data_ptr()) ||
+        !context->setTensorAddress("feats", featsData.data_ptr()) ||
+        !context->setTensorAddress("keypoints", keypointsData.data_ptr()) ||
+        !context->setTensorAddress("heatmaps", heatmapData.data_ptr()) ||
+        !context->enqueueV3(stream_.stream())) {
+        throw std::runtime_error("TensorRT XFeat inference failed");
+    }
+#else
     void* buffers[4]; 
     buffers[inputIndex] = input_Data.data_ptr();
     buffers[featsIndex] = featsData.data_ptr();
@@ -154,6 +175,7 @@ void XFeat::detectDense(const cv::Mat& img, torch::Tensor& keypoints, torch::Ten
 
     // Run inference on TensorRT engine
     context->executeV2(buffers);
+#endif
 
     featsData = featsData.permute({0, 2, 3, 1}).reshape({batchSize, -1, 64});
     heatmapData = heatmapData.permute({0, 2, 3, 1}).reshape({batchSize, -1});
@@ -171,9 +193,6 @@ void XFeat::detectDense(const cv::Mat& img, torch::Tensor& keypoints, torch::Ten
     
     feats = feats.squeeze(0);
     mkpts = mkpts.squeeze(0);
-
-    // Synchronize operations before transferring results to the CPU
-    torch::cuda::synchronize();
 
     // Return the results to the CPU
     keypoints = mkpts.cpu();
